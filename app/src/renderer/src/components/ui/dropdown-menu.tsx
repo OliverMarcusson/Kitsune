@@ -1,28 +1,64 @@
 import * as React from "react"
 import * as DropdownMenuPrimitive from "@radix-ui/react-dropdown-menu"
+import { AnimatePresence, motion } from "motion/react"
 
 import { cn } from "@/lib/utils"
+import { overlayTransition, useOpenState } from "@/lib/motion"
 
-const DropdownMenu = DropdownMenuPrimitive.Root
+const DropdownMenuOpenContext = React.createContext(false)
+
+function DropdownMenu({
+  open,
+  defaultOpen,
+  onOpenChange,
+  ...props
+}: React.ComponentProps<typeof DropdownMenuPrimitive.Root>) {
+  const [isOpen, setOpen] = useOpenState(open, defaultOpen, onOpenChange)
+  return (
+    <DropdownMenuOpenContext.Provider value={isOpen}>
+      <DropdownMenuPrimitive.Root open={isOpen} onOpenChange={setOpen} {...props} />
+    </DropdownMenuOpenContext.Provider>
+  )
+}
 const DropdownMenuTrigger = DropdownMenuPrimitive.Trigger
 const DropdownMenuPortal = DropdownMenuPrimitive.Portal
 
 const DropdownMenuContent = React.forwardRef<
   React.ComponentRef<typeof DropdownMenuPrimitive.Content>,
   React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Content>
->(({ className, sideOffset = 4, ...props }, ref) => (
-  <DropdownMenuPrimitive.Portal>
-    <DropdownMenuPrimitive.Content
-      ref={ref}
-      sideOffset={sideOffset}
-      className={cn(
-        "z-50 min-w-[10rem] overflow-hidden rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-xl data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=top]:slide-in-from-bottom-2",
-        className
+>(({ className, sideOffset = 4, children, ...props }, ref) => {
+  const open = React.useContext(DropdownMenuOpenContext)
+  return (
+    <AnimatePresence>
+      {open && (
+        <DropdownMenuPrimitive.Portal forceMount>
+          <DropdownMenuPrimitive.Content
+            ref={ref}
+            sideOffset={sideOffset}
+            forceMount
+            asChild
+            {...props}
+          >
+            <motion.div
+              className={cn(
+                "z-50 min-w-[10rem] overflow-hidden rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-xl",
+                className
+              )}
+              // Grow out of the trigger, whichever side Radix placed the menu on.
+              style={{ transformOrigin: "var(--radix-dropdown-menu-content-transform-origin)" }}
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              transition={overlayTransition}
+            >
+              {children}
+            </motion.div>
+          </DropdownMenuPrimitive.Content>
+        </DropdownMenuPrimitive.Portal>
       )}
-      {...props}
-    />
-  </DropdownMenuPrimitive.Portal>
-))
+    </AnimatePresence>
+  )
+})
 DropdownMenuContent.displayName = DropdownMenuPrimitive.Content.displayName
 
 const DropdownMenuItem = React.forwardRef<

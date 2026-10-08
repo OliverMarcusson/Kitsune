@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Plus, Search, X } from "lucide-react"
+import { AnimatePresence, motion } from "motion/react"
 import { toast } from "sonner"
 
 import { AddDownloadDialog } from "./components/AddDownloadDialog"
@@ -48,6 +49,13 @@ const EMPTY_COPY: Record<Exclude<View, "settings">, { title: string; description
     description: "Downloads that error out will show up here with the reason why.",
   },
 }
+
+const FADE = {
+  initial: { opacity: 0 },
+  animate: { opacity: 1 },
+  exit: { opacity: 0 },
+  transition: { duration: 0.15, ease: "easeOut" },
+} as const
 
 function App() {
   const [view, setView] = useState<View>("all")
@@ -195,34 +203,53 @@ function App() {
                 onUpdate={updateSetting}
                 onReset={resetSettings}
               />
-            ) : visible.length === 0 ? (
-              <div className="h-[calc(100vh-3.5rem)]">
-                {query ? (
-                  <EmptyState
-                    title="No matches"
-                    description={`Nothing here matches "${query.trim()}".`}
-                  />
-                ) : (
-                  <EmptyState
-                    {...EMPTY_COPY[view]}
-                    onAdd={view === "all" ? openAddDialog : undefined}
-                  />
-                )}
-              </div>
             ) : (
-              <div className="space-y-2.5 p-5">
-                {visible.map((download) => (
-                  <DownloadRow
-                    key={download.id}
-                    download={download}
-                    onPause={pauseDownload}
-                    onResume={resumeDownload}
-                    onRemove={requestRemove}
-                    onDismiss={dismissDownload}
-                    onOpenFolder={openFolder}
-                  />
-                ))}
-              </div>
+              /* Crossfade between the list and the empty state, so the first row
+                 arriving and the last one leaving are not hard cuts. */
+              <AnimatePresence mode="wait" initial={false}>
+                {visible.length === 0 ? (
+                  <motion.div key="empty" className="h-[calc(100vh-3.5rem)]" {...FADE}>
+                    {query ? (
+                      <EmptyState
+                        title="No matches"
+                        description={`Nothing here matches "${query.trim()}".`}
+                      />
+                    ) : (
+                      <EmptyState
+                        {...EMPTY_COPY[view]}
+                        onAdd={view === "all" ? openAddDialog : undefined}
+                      />
+                    )}
+                  </motion.div>
+                ) : (
+                  <motion.div key="list" className="relative space-y-2.5 p-5" {...FADE}>
+                    {/* New rows drop in and removed ones fade while the rest close the gap.
+                        ponytail: `layout` measures every row on each progress tick; fine for
+                        dozens of rows, virtualize the list if it ever holds hundreds. */}
+                    <AnimatePresence initial={false} mode="popLayout">
+                      {visible.map((download) => (
+                        <motion.div
+                          key={download.id}
+                          layout="position"
+                          initial={{ opacity: 0, y: -8 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          exit={{ opacity: 0, scale: 0.98 }}
+                          transition={{ duration: 0.2, ease: "easeOut" }}
+                        >
+                          <DownloadRow
+                            download={download}
+                            onPause={pauseDownload}
+                            onResume={resumeDownload}
+                            onRemove={requestRemove}
+                            onDismiss={dismissDownload}
+                            onOpenFolder={openFolder}
+                          />
+                        </motion.div>
+                      ))}
+                    </AnimatePresence>
+                  </motion.div>
+                )}
+              </AnimatePresence>
             )}
           </ScrollArea>
         </div>

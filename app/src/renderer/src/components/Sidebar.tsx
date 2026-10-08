@@ -7,6 +7,7 @@ import {
   Settings,
   type LucideIcon,
 } from "lucide-react"
+import { AnimatePresence, motion } from "motion/react"
 
 import logoUrl from "@/assets/logo.png"
 import { Separator } from "@/components/ui/separator"
@@ -32,6 +33,22 @@ const NAV_ITEMS: NavItem[] = [
   { view: "completed", label: "Completed", icon: CheckCircle2, activeIcon: "text-success" },
   { view: "error", label: "Failed", icon: AlertCircle, activeIcon: "text-destructive" },
 ]
+
+const MotionSettings = motion.create(Settings)
+
+/**
+ * The active item's background. Shared layoutId lets it glide between items,
+ * including down to Settings, so the eye follows where the view went.
+ */
+function ActiveHighlight() {
+  return (
+    <motion.span
+      layoutId="sidebar-active"
+      className="absolute inset-0 -z-10 rounded-md bg-primary/15"
+      transition={{ type: "spring", stiffness: 500, damping: 40 }}
+    />
+  )
+}
 
 interface SidebarProps {
   view: View
@@ -62,12 +79,13 @@ export function Sidebar({ view, onViewChange, counts, totalSpeed, activeCount }:
               key={item.view}
               onClick={() => onViewChange(item.view)}
               className={cn(
-                "group flex items-center gap-2.5 rounded-md px-2.5 py-2 text-sm transition-colors",
+                "group relative isolate flex items-center gap-2.5 rounded-md px-2.5 py-2 text-sm transition-colors",
                 isActive
-                  ? "bg-primary/15 font-medium text-foreground"
+                  ? "font-medium text-foreground"
                   : "text-muted-foreground hover:bg-accent/60 hover:text-foreground"
               )}
             >
+              {isActive && <ActiveHighlight />}
               <item.icon
                 className={cn(
                   "h-4 w-4 shrink-0 transition-colors",
@@ -93,36 +111,47 @@ export function Sidebar({ view, onViewChange, counts, totalSpeed, activeCount }:
       <div className="mt-auto px-2 pb-2">
         <Separator className="my-2" />
 
-        <button
+        <motion.button
           onClick={() => onViewChange("settings")}
           className={cn(
-            "group flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-sm transition-colors",
+            "group relative isolate flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-sm transition-colors",
             view === "settings"
-              ? "bg-primary/15 font-medium text-foreground"
+              ? "font-medium text-foreground"
               : "text-muted-foreground hover:bg-accent/60 hover:text-foreground"
           )}
+          initial={false}
+          animate={view === "settings" ? "active" : "rest"}
+          whileHover="hover"
         >
-          <Settings
-            className={cn(
-              "h-4 w-4 shrink-0 transition-transform duration-500",
-              view === "settings" ? "rotate-90 text-primary" : "group-hover:rotate-90"
-            )}
+          {view === "settings" && <ActiveHighlight />}
+          <MotionSettings
+            className={cn("h-4 w-4 shrink-0", view === "settings" && "text-primary")}
+            variants={{ rest: { rotate: 0 }, hover: { rotate: 90 }, active: { rotate: 90 } }}
+            transition={{ duration: 0.5, ease: "easeOut" }}
           />
           Settings
-        </button>
+        </motion.button>
 
         {/* Live throughput readout. Hidden entirely when nothing is running so
             the sidebar does not show a permanent "0 B/s". */}
-        {activeCount > 0 && (
-          <div className="mt-2 rounded-md border border-primary/20 bg-primary/10 px-3 py-2.5">
-            <p className="text-[11px] uppercase tracking-wide text-muted-foreground">
-              {activeCount} active
-            </p>
-            <p className="mt-1 font-semibold tabular-nums text-primary">
-              {formatSpeed(totalSpeed)}
-            </p>
-          </div>
-        )}
+        <AnimatePresence initial={false}>
+          {activeCount > 0 && (
+            <motion.div
+              className="mt-2 rounded-md border border-primary/20 bg-primary/10 px-3 py-2.5"
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 6 }}
+              transition={{ duration: 0.2, ease: "easeOut" }}
+            >
+              <p className="text-[11px] uppercase tracking-wide text-muted-foreground">
+                {activeCount} active
+              </p>
+              <p className="mt-1 font-semibold tabular-nums text-primary">
+                {formatSpeed(totalSpeed)}
+              </p>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
     </aside>
   )

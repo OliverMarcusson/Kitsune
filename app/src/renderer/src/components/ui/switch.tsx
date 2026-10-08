@@ -1,8 +1,10 @@
 import * as React from "react"
 import * as SwitchPrimitives from "@radix-ui/react-switch"
+import { motion } from "motion/react"
 
 import { cn } from "@/lib/utils"
 
+/** Controlled only: the thumb position follows the `checked` prop. */
 const Switch = React.forwardRef<
   React.ComponentRef<typeof SwitchPrimitives.Root>,
   React.ComponentPropsWithoutRef<typeof SwitchPrimitives.Root>
@@ -15,11 +17,14 @@ const Switch = React.forwardRef<
     {...props}
     ref={ref}
   >
-    <SwitchPrimitives.Thumb
-      className={cn(
-        "pointer-events-none block h-4 w-4 rounded-full bg-foreground shadow-lg ring-0 transition-transform data-[state=checked]:translate-x-4 data-[state=unchecked]:translate-x-0"
-      )}
-    />
+    <SwitchPrimitives.Thumb asChild>
+      <motion.span
+        className="pointer-events-none block h-4 w-4 rounded-full bg-foreground shadow-lg ring-0"
+        initial={false}
+        animate={{ x: props.checked ? 16 : 0 }}
+        transition={{ type: "spring", stiffness: 700, damping: 35 }}
+      />
+    </SwitchPrimitives.Thumb>
   </SwitchPrimitives.Root>
 ))
 Switch.displayName = SwitchPrimitives.Root.displayName

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import { AlertCircle, Download, FolderOpen, Link2, Loader2, Search } from "lucide-react"
+import { motion } from "motion/react"
 
 import { Button } from "@/components/ui/button"
 import {
@@ -19,6 +20,8 @@ import type { Settings } from "@/hooks/useSettings"
 import type { Metadata } from "../../../shared/ipc"
 
 const CONNECTION_CHOICES = [1, 2, 4, 8, 16]
+
+const Spinner = motion.create(Loader2)
 
 interface AddDownloadDialogProps {
   open: boolean
@@ -161,7 +164,12 @@ export function AddDownloadDialog({
                 onClick={() => void fetchMetadata(url)}
                 disabled={loading || !url.trim()}
               >
-                {loading ? <Loader2 className="animate-spin" /> : <Search />}
+                {loading ? (
+                  <Spinner
+                    animate={{ rotate: 360 }}
+                    transition={{ duration: 1, ease: "linear", repeat: Infinity }}
+                  />
+                ) : <Search />}
                 Fetch
               </Button>
             </div>

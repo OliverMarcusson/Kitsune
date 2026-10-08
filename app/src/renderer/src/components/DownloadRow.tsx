@@ -13,6 +13,7 @@ import {
   X,
   Zap,
 } from "lucide-react"
+import { motion } from "motion/react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -170,7 +171,11 @@ export function DownloadRow({
             <div className="flex shrink-0 items-center gap-1">
               <Badge variant={meta.badge} className="mr-1">
                 {status === "downloading" && (
-                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-current" />
+                  <motion.span
+                    className="h-1.5 w-1.5 rounded-full bg-current"
+                    animate={{ opacity: [1, 0.4, 1] }}
+                    transition={{ duration: 1.6, ease: "easeInOut", repeat: Infinity }}
+                  />
                 )}
                 {status === "completed" && <CheckCircle2 className="h-3 w-3" />}
                 {status === "error" && <AlertCircle className="h-3 w-3" />}
@@ -255,7 +260,12 @@ export function DownloadRow({
                 /* No Content-Length: show motion instead of a fake percentage. */
                 <div className="relative h-1.5 overflow-hidden rounded-full bg-secondary">
                   {status === "downloading" && (
-                    <span className="absolute inset-y-0 w-1/4 animate-indeterminate rounded-full bg-primary" />
+                    <motion.span
+                      className="absolute inset-y-0 w-1/4 rounded-full bg-primary"
+                      initial={{ x: "-100%" }}
+                      animate={{ x: "400%" }}
+                      transition={{ duration: 1.4, ease: "easeInOut", repeat: Infinity }}
+                    />
                   )}
                 </div>
               )}

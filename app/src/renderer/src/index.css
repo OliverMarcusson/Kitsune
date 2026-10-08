@@ -90,18 +90,4 @@
       radial-gradient(60rem 30rem at 15% -10%, hsl(var(--primary) / 0.16), transparent 60%),
       radial-gradient(45rem 25rem at 105% 5%, hsl(280 80% 60% / 0.1), transparent 55%);
   }
-
-  /* Indeterminate shimmer for progress bars with an unknown total size. */
-  .animate-indeterminate {
-    animation: kitsune-indeterminate 1.4s ease-in-out infinite;
-  }
-
-  @keyframes kitsune-indeterminate {
-    0% {
-      transform: translateX(-100%);
-    }
-    100% {
-      transform: translateX(400%);
-    }
-  }
 }
