@@ -1,6 +1,6 @@
 {
   "name": "kitsune-dm",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Kitsune Download Manager desktop app",
   "desktopName": "kitsune-dm",
   "main": "./out/main/index.js",
