@@ -51,8 +51,10 @@ function handleDeepLink(rawUrl: string): void {
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
-    width: 800,
-    height: 600,
+    width: 1200,
+    height: 750,
+    minWidth: 960,
+    minHeight: 600,
     title: 'Kitsune Download Manager',
     show: false,
     autoHideMenuBar: true,
