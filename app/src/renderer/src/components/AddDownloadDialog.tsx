@@ -35,7 +35,8 @@ interface AddDownloadDialogProps {
     filename: string,
     path: string,
     totalSize: number,
-    connections: number
+    connections: number,
+    kind?: 'http' | 'torrent'
   ) => void
 }
 
@@ -116,14 +117,18 @@ export function AddDownloadDialog({
     if (!metadata || !filename || !saveDir) return
 
     const downloadId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
-    const path = `${saveDir.replace(/[/\\]+$/, "")}/${filename}`
+    if (/[\\/:*?"<>|]/.test(filename) || filename === "." || filename === "..") {
+      setError("Choose a filename without path separators or reserved characters")
+      return
+    }
+    const path = `${saveDir.replace(/[/\\]+$/, "")}/${filename}${metadata.kind === 'torrent' ? `-${downloadId}` : ''}`
 
     // Hand off before closing so the row is already on screen behind the dialog.
-    onStarted(downloadId, url.trim(), filename, path, metadata.size, connections)
+    onStarted(downloadId, url.trim(), filename, path, metadata.size, connections, metadata.kind)
     onOpenChange(false)
 
     void window.kitsune
-      .startDownload({ downloadId, url: url.trim(), path, connections })
+      .startDownload({ downloadId, url: url.trim(), path, connections, kind: metadata.kind })
       .catch((e) => console.error("start-download failed:", e))
   }
 
@@ -139,7 +144,7 @@ export function AddDownloadDialog({
             New download
           </DialogTitle>
           <DialogDescription>
-            Paste a link and Kitsune will fetch its details before starting.
+            Paste a direct link or magnet link, or open a .torrent file.
           </DialogDescription>
         </DialogHeader>
 
@@ -152,7 +157,7 @@ export function AddDownloadDialog({
                 <Input
                   id="download-url"
                   value={url}
-                  onChange={(e) => setUrl(e.target.value)}
+                  onChange={(e) => { setUrl(e.target.value); setMetadata(null); requestRef.current += 1; setLoading(false) }}
                   onKeyDown={(e) => e.key === "Enter" && void fetchMetadata(url)}
                   placeholder="https://example.com/file.zip"
                   autoFocus
@@ -174,6 +179,12 @@ export function AddDownloadDialog({
               </Button>
             </div>
           </div>
+
+          <Button variant="outline" onClick={() => {
+            void window.kitsune.pickTorrent().then(path => {
+              if (path) { setUrl(path); void fetchMetadata(path) }
+            })
+          }}>Open .torrent file</Button>
 
           {error && (
             <div className="flex items-start gap-2.5 rounded-md border border-destructive/25 bg-destructive/10 px-3 py-2.5 text-sm text-destructive">
@@ -226,7 +237,7 @@ export function AddDownloadDialog({
                 </div>
               </div>
 
-              <div className="space-y-1.5">
+              {metadata.kind !== 'torrent' && <div className="space-y-1.5">
                 <Label>Parallel connections</Label>
                 <div className="flex gap-1.5">
                   {CONNECTION_CHOICES.map((n) => (
@@ -244,7 +255,7 @@ export function AddDownloadDialog({
                     </button>
                   ))}
                 </div>
-              </div>
+              </div>}
             </>
           )}
         </div>

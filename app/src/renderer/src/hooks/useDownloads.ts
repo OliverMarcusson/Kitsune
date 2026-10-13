@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { toast } from "sonner";
 import type {
   CompletedPayload,
   ErrorPayload,
@@ -7,7 +8,7 @@ import type {
   ProgressPayload,
 } from "../../../shared/ipc";
 
-export type DownloadStatus = "downloading" | "completed" | "error" | "paused";
+export type DownloadStatus = "downloading" | "completed" | "error" | "paused" | "queued";
 
 export interface Download {
   id: string;
@@ -25,6 +26,7 @@ export interface Download {
   activeConnections: number;
   error?: string;
   startedAt: number;
+  kind?: "http" | "torrent";
 }
 
 
@@ -39,6 +41,7 @@ function toPersistedDownload(d: Download): PersistedDownload {
     status: d.status,
     connections: d.connections,
     started_at: d.startedAt,
+    kind: d.kind,
   };
 }
 
@@ -56,6 +59,7 @@ function fromPersistedDownload(p: PersistedDownload): Download {
     connections: p.connections,
     activeConnections: 0,
     startedAt: p.started_at,
+    kind: p.kind,
   };
 }
 
@@ -75,7 +79,7 @@ export function useDownloads() {
       downloadedBytes: 0,
       speed: 0,
       eta: 0,
-      status: "downloading",
+      status: "queued",
       activeConnections: 0,
       startedAt: Date.now(),
     };
@@ -85,10 +89,7 @@ export function useDownloads() {
   }, []);
 
   const pauseDownload = useCallback((id: string) => {
-    void window.kitsune.cancelDownload(id);
-    setDownloads(prev => prev.map(d =>
-      d.id === id ? { ...d, status: "paused", speed: 0, eta: 0, activeConnections: 0 } : d
-    ));
+    void window.kitsune.cancelDownload(id).catch(error => toast.error("Could not pause download", { description: error.message }));
   }, []);
 
   const resumeDownload = useCallback((id: string) => {
@@ -104,35 +105,34 @@ export function useDownloads() {
       url: target.url,
       path: target.path,
       connections: target.connections,
-    });
+      kind: target.kind,
+    }).catch(error => setDownloads(prev => prev.map(d => d.id === id ? { ...d, status: "error", error: error.message } : d)));
   }, [downloads]);
 
   const removeDownload = useCallback(async (id: string) => {
     const target = downloads.find(d => d.id === id);
     if (!target) return;
 
-    if (target.status === "downloading") {
-      void window.kitsune.cancelDownload(id);
-    }
-
-    // Drop both the resume session and the (partial or finished) payload; the
-    // non-destructive counterpart is dismissDownload, which only clears the row.
-    void window.kitsune.deleteFile(`${target.path}.kitsune`);
-    void window.kitsune.deleteFile(target.path);
-
-    setDownloads(prev => prev.filter(d => d.id !== id));
+    try {
+      await window.kitsune.deleteDownload({ downloadId: id, url: target.url, path: target.path, connections: target.connections, kind: target.kind });
+      setDownloads(prev => prev.filter(d => d.id !== id));
+    } catch (error) { toast.error("Could not delete files", { description: (error as Error).message }); }
   }, [downloads]);
 
-  const dismissDownload = useCallback((id: string) => {
+  const dismissDownload = useCallback(async (id: string) => {
     const target = downloads.find(d => d.id === id);
     if (!target) return;
 
-    if (target.status === "downloading") {
-      void window.kitsune.cancelDownload(id);
-    }
-
-    setDownloads(prev => prev.filter(d => d.id !== id));
+    try {
+      await window.kitsune.forgetDownload(id);
+      setDownloads(prev => prev.filter(d => d.id !== id));
+    } catch (error) { toast.error("Could not remove download", { description: (error as Error).message }); }
   }, [downloads]);
+
+  const replaceUrl = useCallback(async (id: string, url: string) => {
+    await window.kitsune.replaceUrl(id, url);
+    setDownloads(prev => prev.map(d => d.id === id ? { ...d, url, status: "paused", error: undefined } : d));
+  }, []);
 
   const openFolder = useCallback((path: string) => {
     void window.kitsune.showInFolder(path);
@@ -144,6 +144,7 @@ export function useDownloads() {
         setDownloads(persisted.map(fromPersistedDownload));
       }
       initializedRef.current = true;
+      void window.kitsune.restoreQueue(persisted);
     }).catch(() => { initializedRef.current = true; });
   }, []);
 
@@ -154,6 +155,19 @@ export function useDownloads() {
   }, [downloads]);
 
   useEffect(() => {
+    const unlistenStarted = window.kitsune.onDownloadStarted(payload => {
+      speedWindowRef.current.set(payload.downloadId, []);
+      setDownloads(prev => prev.map(d => d.id === payload.downloadId ? {
+        ...d, downloadedBytes: payload.downloadedBytes, totalSize: payload.totalSize,
+        filename: payload.filename || d.filename,
+      } : d));
+    });
+    const unlistenState = window.kitsune.onDownloadState(payload => {
+      speedWindowRef.current.delete(payload.downloadId);
+      setDownloads(prev => prev.map(d => d.id === payload.downloadId ? {
+        ...d, status: payload.status, error: undefined, speed: 0, eta: 0, activeConnections: 0,
+      } : d));
+    });
     const unlistenProgress = window.kitsune.onDownloadProgress((payload: ProgressPayload) => {
       const { downloadId, bytesDownloaded, activeWorkers } = payload;
       const now = Date.now();
@@ -239,6 +253,8 @@ export function useDownloads() {
       unlistenCompleted();
       unlistenError();
       unlistenPaused();
+      unlistenStarted();
+      unlistenState();
     };
   }, []);
 
@@ -249,6 +265,7 @@ export function useDownloads() {
     resumeDownload, 
     removeDownload, 
     dismissDownload, 
-    openFolder 
+    openFolder,
+    replaceUrl,
   };
 }

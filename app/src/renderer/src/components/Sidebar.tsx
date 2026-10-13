@@ -30,6 +30,7 @@ const NAV_ITEMS: NavItem[] = [
   { view: "all", label: "All", icon: Inbox, activeIcon: "text-primary" },
   { view: "downloading", label: "Active", icon: ArrowDownToLine, activeIcon: "text-primary" },
   { view: "paused", label: "Paused", icon: Pause, activeIcon: "text-warning" },
+  { view: "queued", label: "Queued", icon: Inbox, activeIcon: "text-warning" },
   { view: "completed", label: "Completed", icon: CheckCircle2, activeIcon: "text-success" },
   { view: "error", label: "Failed", icon: AlertCircle, activeIcon: "text-destructive" },
 ]

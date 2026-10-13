@@ -12,7 +12,7 @@ now the only frontend, and the only thing the release workflow builds.
 
 ## Architecture
 
-The Rust download engine is unchanged. `kitsune-core` runs as a **sidecar
+`kitsune-core` runs as a **sidecar
 process** (`crates/daemon`), and Electron's main process speaks newline-delimited
 JSON to it over stdio:
 
@@ -26,7 +26,8 @@ kitsune-daemon ── kitsune-core
 
 Requests are `{"id","cmd",...}` and are answered with `{"id","ok"}` or
 `{"id","error"}`. Progress arrives unsolicited as `{"event":...}`. Only
-`get_metadata`, `start_download` and `cancel_download` reach Rust; file deletion,
+HTTP metadata, start/cancel, file-version validation, URL replacement, and rate
+updates reach Rust; file deletion,
 folder reveal, the downloads directory and state persistence are plain Electron
 main-process calls that never needed it.
 
@@ -50,9 +51,12 @@ dark-only violet palette. The palette lives as HSL triples on `:root` in
 `.dark` class and no light theme, so colours belong in tokens (`bg-primary`,
 `text-muted-foreground`) rather than as literal `zinc-800`/`blue-600` classes.
 
-The shell is a status sidebar plus a filtered list. Preferences are renderer-only
-and live in `localStorage` (`useSettings`) — nothing in main or the sidecar reads
-them, so no IPC channel was added for settings.
+The shell is a status sidebar plus a filtered list. UI preferences live in
+`localStorage` (`useSettings`). Transfer settings are sent through the preload
+bridge and also persisted as `transfers.json` in the Kitsune config directory.
+`main/transfers.ts` owns scheduling and the queue, independently of the renderer.
+`main/torrents.ts` lazily loads WebTorrent and preserves its owned-file manifest
+beside torrent payloads. The Rust and torrent engines share one speed budget.
 
 Two things worth knowing:
 

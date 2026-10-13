@@ -8,6 +8,7 @@ import { ConfirmDialog } from "./components/ConfirmDialog"
 import { DownloadRow } from "./components/DownloadRow"
 import { EmptyState } from "./components/EmptyState"
 import { SettingsView } from "./components/SettingsView"
+import { RepairLinkDialog } from "./components/RepairLinkDialog"
 import { Sidebar, type View } from "./components/Sidebar"
 import { Button } from "./components/ui/button"
 import { Input } from "./components/ui/input"
@@ -21,6 +22,7 @@ const VIEW_TITLES: Record<View, string> = {
   all: "All downloads",
   downloading: "Active",
   paused: "Paused",
+  queued: "Queued",
   completed: "Completed",
   error: "Failed",
   settings: "Settings",
@@ -40,6 +42,7 @@ const EMPTY_COPY: Record<Exclude<View, "settings">, { title: string; description
     title: "Nothing paused",
     description: "Downloads you pause will wait for you here.",
   },
+  queued: { title: "Nothing queued", description: "Downloads waiting for a free slot or their scheduled window appear here." },
   completed: {
     title: "Nothing finished yet",
     description: "Completed downloads collect here so you can find them later.",
@@ -64,6 +67,7 @@ function App() {
   const [pendingUrl, setPendingUrl] = useState("")
   /** Id awaiting confirmation for the destructive "delete files" removal. */
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
+  const [repairId, setRepairId] = useState<string | null>(null)
 
   const { settings, updateSetting, resetSettings } = useSettings()
   const {
@@ -74,6 +78,7 @@ function App() {
     removeDownload,
     dismissDownload,
     openFolder,
+    replaceUrl,
   } = useDownloads()
 
   useEffect(() => {
@@ -106,6 +111,7 @@ function App() {
       all: downloads.length,
       downloading: downloads.filter((d) => d.status === "downloading").length,
       paused: downloads.filter((d) => d.status === "paused").length,
+      queued: downloads.filter((d) => d.status === "queued").length,
       completed: downloads.filter((d) => d.status === "completed").length,
       error: downloads.filter((d) => d.status === "error").length,
       settings: 0,
@@ -166,6 +172,9 @@ function App() {
         <div className="flex min-w-0 flex-1 flex-col">
           <header className="flex h-14 shrink-0 items-center gap-3 border-b border-border px-5">
             <h1 className="text-sm font-semibold">{VIEW_TITLES[view]}</h1>
+            <Button variant={settings.slowMode ? "secondary" : "outline"} size="sm" aria-pressed={settings.slowMode} onClick={() => updateSetting("slowMode", !settings.slowMode)}>
+              {settings.slowMode ? "Slow mode on" : "Slow mode"}
+            </Button>
 
             {view !== "settings" && (
               <>
@@ -243,6 +252,7 @@ function App() {
                             onRemove={requestRemove}
                             onDismiss={dismissDownload}
                             onOpenFolder={openFolder}
+                            onRepair={setRepairId}
                           />
                         </motion.div>
                       ))}
@@ -259,10 +269,12 @@ function App() {
           onOpenChange={setAddOpen}
           initialUrl={pendingUrl}
           settings={settings}
-          onStarted={(id, url, filename, path, totalSize, connections) =>
-            addDownload({ id, url, filename, path, totalSize, connections })
+          onStarted={(id, url, filename, path, totalSize, connections, kind) =>
+            addDownload({ id, url, filename, path, totalSize, connections, kind })
           }
         />
+
+        <RepairLinkDialog download={downloads.find(d => d.id === repairId)} onClose={() => setRepairId(null)} onRepair={replaceUrl} />
 
         <ConfirmDialog
           open={pendingDelete !== null}

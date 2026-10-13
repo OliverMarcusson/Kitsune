@@ -1,170 +1,219 @@
-use super::session::{DownloadSession, DownloadState};
-use super::worker::Worker;
-use anyhow::Result;
-use reqwest::{Client, header};
-use std::path::PathBuf;
-use tokio::fs::OpenOptions;
-use tokio::sync::mpsc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::collections::HashMap;
-use tokio::time::timeout;
-use std::time::{Duration, Instant};
+use crate::{
+    controls::{Concurrency, RateLimiter},
+    session::{DownloadPart, DownloadSession, DownloadState},
+    worker::{Worker, WorkerEvent},
+};
+use anyhow::{Result, bail};
+use reqwest::{Client, StatusCode, header};
+use std::{
+    collections::{HashSet, VecDeque},
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+use tokio::{
+    fs::OpenOptions,
+    sync::{Mutex, mpsc},
+    task::JoinSet,
+};
 
 pub trait DownloadObserver: Send + Sync {
     fn on_progress(&self, worker_id: u8, bytes_downloaded: u64, active_workers: usize);
+    fn on_started(&self, _downloaded: u64, _total: Option<u64>) {}
 }
-
 pub struct ChannelObserver {
     tx: mpsc::Sender<(u8, u64, usize)>,
 }
-
 impl ChannelObserver {
     pub fn new(tx: mpsc::Sender<(u8, u64, usize)>) -> Self {
         Self { tx }
     }
 }
-
 impl DownloadObserver for ChannelObserver {
-    fn on_progress(&self, worker_id: u8, bytes_downloaded: u64, active_workers: usize) {
-        let _ = self.tx.try_send((worker_id, bytes_downloaded, active_workers));
+    fn on_progress(&self, id: u8, bytes: u64, active: usize) {
+        let _ = self.tx.try_send((id, bytes, active));
     }
 }
-
+struct Metadata {
+    filename: String,
+    size: Option<u64>,
+    ranged: bool,
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
 #[derive(Clone)]
 pub struct Downloader {
     client: Client,
+    limiter: Arc<RateLimiter>,
 }
-
 impl Downloader {
     pub fn new(user_agent: &str) -> Result<Self> {
-        let client = Client::builder()
-            .user_agent(user_agent)
-            .timeout(std::time::Duration::from_secs(30))
-            .pool_max_idle_per_host(0)
-            .build()?;
-            
         Ok(Self {
-            client,
+            client: Client::builder()
+                .user_agent(user_agent)
+                .connect_timeout(Duration::from_secs(30))
+                .read_timeout(Duration::from_secs(30))
+                .pool_max_idle_per_host(0)
+                .build()?,
+            limiter: Arc::new(RateLimiter::default()),
         })
     }
-
-    pub async fn get_remote_metadata(&self, url: &str) -> Result<(String, Option<u64>, bool)> {
-        let response = self.client
+    pub fn with_limiter(mut self, limiter: Arc<RateLimiter>) -> Self {
+        self.limiter = limiter;
+        self
+    }
+    async fn metadata(&self, url: &str) -> Result<Metadata> {
+        let response = self
+            .client
             .get(url)
             .header(header::RANGE, "bytes=0-0")
+            .header(header::ACCEPT_ENCODING, "identity")
             .send()
             .await?;
+        response.error_for_status_ref()?;
         let headers = response.headers();
-
-        let total_size = headers
-            .get(header::CONTENT_RANGE)
-            .and_then(|val| val.to_str().ok())
-            .and_then(|val| val.split('/').next_back())
-            .and_then(|val| val.parse::<u64>().ok())
-            .or_else(|| {
-                headers
-                    .get(header::CONTENT_LENGTH)
-                    .and_then(|val| val.to_str().ok())
-                    .and_then(|val| val.parse::<u64>().ok())
-            });
-
-        let accept_ranges = headers.get(header::CONTENT_RANGE).is_some()
-            || headers
-                .get(header::ACCEPT_RANGES)
-                .and_then(|val| val.to_str().ok())
-                .map(|val| val == "bytes")
-                .unwrap_or(false);
-
-        let content_disposition = headers
-            .get(header::CONTENT_DISPOSITION)
-            .and_then(|val| val.to_str().ok());
-
-        let filename_from_header = content_disposition
-            .and_then(|cd| {
-                if let Some(idx) = cd.find("filename=") {
-                    let remaining = &cd[idx + 9..];
-                    let end_idx = remaining.find(';').unwrap_or(remaining.len());
-                    let raw_name = &remaining[..end_idx];
-                    Some(raw_name.trim_matches('"').to_string())
-                } else {
-                    None
-                }
-            });
-
-        let filename = filename_from_header.unwrap_or_else(|| {
-            url.split('/')
-                .next_back()
-                .map(|s| s.split('?').next().unwrap_or(s))
-                .filter(|s| !s.is_empty())
-                .unwrap_or("download.bin")
-                .to_string()
-        });
-
-        Ok((filename, total_size, accept_ranges))
-    }
-
-    pub async fn init_download(&self, url: &str, output_path: Option<PathBuf>, connections: u8) -> Result<DownloadSession> {
-        let (filename, total_size, accept_ranges) = self.get_remote_metadata(url).await?;
-        
-        let final_path = if let Some(path) = output_path {
-            path
-        } else {
-            crate::utils::fs::get_downloads_dir().join(filename)
+        let value = |name| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
         };
-
-        let mut session = DownloadSession::new(url.to_string(), final_path, connections);
-        session.total_size = total_size;
-
-        if let Some(size) = total_size {
-             if accept_ranges && connections > 1 {
-                let part_size = size / connections as u64;
-                let mut start_byte = 0;
-
-                for i in 0..connections {
-                    let end_byte = if i == connections - 1 {
-                        size - 1
-                    } else {
-                        start_byte + part_size - 1
-                    };
-
-                    session.parts.push(super::session::DownloadPart {
-                        id: i,
-                        start_byte,
-                        end_byte,
-                        current_byte: start_byte,
-                        completed: false,
-                    });
-
-                    start_byte = end_byte + 1;
-                }
-            } else {
-                session.parts.push(super::session::DownloadPart {
-                    id: 0,
-                    start_byte: 0,
-                    end_byte: size - 1,
-                    current_byte: 0,
+        let ranged = response.status() == StatusCode::PARTIAL_CONTENT;
+        let size = if ranged {
+            value(header::CONTENT_RANGE).and_then(|v| v.split('/').next_back()?.parse().ok())
+        } else {
+            value(header::CONTENT_LENGTH).and_then(|v| v.parse().ok())
+        };
+        let ranged = ranged && size.is_some();
+        let filename = value(header::CONTENT_DISPOSITION)
+            .and_then(|cd| {
+                cd.split(';').find_map(|part| {
+                    part.trim()
+                        .strip_prefix("filename=")
+                        .map(|s| s.trim_matches('"').to_owned())
+                })
+            })
+            .unwrap_or_else(|| {
+                url.split('?')
+                    .next()
+                    .unwrap_or(url)
+                    .rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("download.bin")
+                    .to_owned()
+            });
+        let filename = filename
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+            .unwrap_or("download.bin")
+            .to_owned();
+        Ok(Metadata {
+            filename,
+            size,
+            ranged,
+            etag: value(header::ETAG).filter(|s| !s.starts_with("W/")),
+            last_modified: value(header::LAST_MODIFIED),
+        })
+    }
+    pub async fn get_remote_metadata(&self, url: &str) -> Result<(String, Option<u64>, bool)> {
+        let meta = self.metadata(url).await?;
+        Ok((meta.filename, meta.size, meta.ranged))
+    }
+    pub async fn init_download(
+        &self,
+        url: &str,
+        output_path: Option<PathBuf>,
+        connections: u8,
+    ) -> Result<DownloadSession> {
+        let meta = self.metadata(url).await?;
+        let mut session = DownloadSession::new(
+            url.to_owned(),
+            output_path
+                .unwrap_or_else(|| crate::utils::fs::get_downloads_dir().join(meta.filename)),
+            connections.clamp(1, 32),
+        );
+        session.total_size = meta.size;
+        session.accepts_ranges = meta.ranged;
+        session.etag = meta.etag;
+        session.last_modified = meta.last_modified;
+        if meta.ranged
+            && let Some(size) = meta.size
+        {
+            let block_size =
+                (size / (session.connections as u64 * 2)).clamp(1024 * 1024, 8 * 1024 * 1024);
+            let mut start = 0;
+            while start < size {
+                let end = (start + block_size).min(size) - 1;
+                session.parts.push(DownloadPart {
+                    id: (session.parts.len() % 256) as u8,
+                    start_byte: start,
+                    end_byte: end,
+                    current_byte: start,
                     completed: false,
                 });
-                session.connections = 1;
+                start = end + 1;
             }
-        } else {
-            // Unknown size, fallback to single connection stream (not fully supported in this arch yet)
-             session.parts.push(super::session::DownloadPart {
+        } else if meta.size != Some(0) {
+            session.parts.push(DownloadPart {
                 id: 0,
                 start_byte: 0,
-                end_byte: 0, // Unknown
+                end_byte: meta.size.map(|n| n - 1).unwrap_or(u64::MAX),
                 current_byte: 0,
                 completed: false,
             });
             session.connections = 1;
         }
-        
-        session.state = DownloadState::Downloading;
-
         Ok(session)
     }
-
+    /// A replacement URL is committed only after proving that it is the same file.
+    pub async fn validate_resume(&self, session: &mut DownloadSession, url: &str) -> Result<()> {
+        let meta = self.metadata(url).await?;
+        let progress = session.parts.iter().any(|p| p.current_byte > p.start_byte);
+        if progress {
+            if !session.output_path.exists() {
+                bail!("Partial file is missing; start a new download");
+            }
+            let length = tokio::fs::metadata(&session.output_path).await?.len();
+            if session
+                .parts
+                .iter()
+                .any(|p| p.current_byte > p.start_byte && p.current_byte > length)
+            {
+                bail!("Partial file was truncated; start a new download");
+            }
+            if !meta.ranged {
+                bail!("Server does not support safe resume; start a new download");
+            }
+            if session.total_size != meta.size {
+                bail!("File size changed; refusing to resume a different file");
+            }
+            let matches = if let Some(etag) = &session.etag {
+                meta.etag.as_ref() == Some(etag)
+            } else if let Some(date) = &session.last_modified {
+                meta.last_modified.as_ref() == Some(date)
+            } else {
+                false
+            };
+            if !matches {
+                bail!("File version changed or cannot be verified; start a new download");
+            }
+        } else if session.total_size != meta.size {
+            bail!("File size changed; start a new download");
+        }
+        if !meta.ranged && session.parts.len() > 1 {
+            bail!("Server no longer supports parallel ranges; start a new download");
+        }
+        session.url = url.to_owned();
+        session.etag = meta.etag;
+        session.last_modified = meta.last_modified;
+        session.accepts_ranges = meta.ranged;
+        Ok(())
+    }
     pub async fn run(
         &self,
         session: &mut DownloadSession,
@@ -172,245 +221,152 @@ impl Downloader {
         session_file: Option<PathBuf>,
         cancel_flag: Option<Arc<AtomicBool>>,
     ) -> Result<()> {
-        // Pre-allocate file only if starting from scratch or if file doesn't exist
-        if !session.output_path.exists() {
-            let file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&session.output_path)
-                .await?;
-            
-            if let Some(size) = session.total_size {
-                file.set_len(size).await?;
-            }
+        self.validate_resume(session, &session.url.clone()).await?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&session.output_path)
+            .await?;
+        if let Some(size) = session.total_size {
+            file.set_len(size).await?;
         }
         session.state = DownloadState::Downloading;
-
-        let (tx, mut rx) = mpsc::channel::<(u8, u64, u8)>(100);
-        let mut handles = vec![];
-        let mut worker_controls: HashMap<u8, Arc<AtomicU64>> = HashMap::new();
-
-        // Spawn initial workers
-        for part in &session.parts {
-            if !part.completed {
-                let atomic_end = Arc::new(AtomicU64::new(part.end_byte));
-                worker_controls.insert(part.id, atomic_end.clone());
-
-                let worker = Worker::new(
-                    part.id,
-                    session.url.clone(),
-                    (part.current_byte, part.end_byte),
-                    session.output_path.clone(),
-                    self.client.clone(),
-                    tx.clone(),
-                    Some(atomic_end),
-                );
-                handles.push(tokio::spawn(async move { worker.run().await }));
+        if let Some(obs) = &observer {
+            obs.on_started(
+                session
+                    .parts
+                    .iter()
+                    .map(|p| p.current_byte - p.start_byte)
+                    .sum(),
+                session.total_size,
+            );
+        }
+        let (tx, mut rx) = mpsc::channel(128);
+        let concurrency = Arc::new(Mutex::new(Concurrency::new(session.connections as usize)));
+        let mut tasks = JoinSet::new();
+        let mut active = HashSet::new();
+        for part in &mut session.parts {
+            if session.accepts_ranges && part.current_byte > part.end_byte {
+                part.completed = true;
             }
         }
-
-        // Keep tx alive for work-stealing
-        let worker_tx = tx.clone();
-        drop(tx);
-
-        let mut last_save = std::time::Instant::now();
-        let mut last_ui_update = Instant::now();
-        let mut pending_bytes: u64 = 0;
-        let mut next_worker_id = session.parts.iter().map(|p| p.id).max().unwrap_or(0) + 1;
-        
+        let mut pending: VecDeque<usize> = session
+            .parts
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.completed)
+            .map(|(i, _)| i)
+            .collect();
+        let mut remaining = pending.len();
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        let mut last_save = tokio::time::Instant::now();
+        let mut last_report = tokio::time::Instant::now();
+        let mut pending_bytes = 0;
+        let mut result = Ok(());
         loop {
-            // Check cancellation
-            if let Some(ref flag) = cancel_flag
-                && flag.load(Ordering::Relaxed)
+            if cancel_flag
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Relaxed))
             {
-                return Err(anyhow::anyhow!("cancelled"));
-            }
-
-            // Check for completion
-            let all_done = session.parts.iter().all(|p| p.completed);
-            if all_done {
+                result = Err(anyhow::anyhow!("cancelled"));
                 break;
             }
-
-            // Receive with timeout
-            match timeout(Duration::from_secs(1), rx.recv()).await {
-                Ok(Some((worker_id, bytes, status))) => {
-                    if status == 2 {
-                        log::error!("Worker {} reported failure", worker_id);
-                        return Err(anyhow::anyhow!("Worker {} reported failure", worker_id));
-                    }
-                    // Update session
-                    if let Some(part) = session.parts.iter_mut().find(|p| p.id == worker_id) {
-                        if status == 1 {
-                            // Worker completed
-                            part.completed = true;
-                        } else {
-                            // Progress update
-                            part.current_byte += bytes;
-                            
-                            if part.current_byte > part.end_byte {
-                               part.completed = true;
-                            }
-                        }
-                    }
-
-                    // Accumulate bytes for throttled UI updates
-                    pending_bytes += bytes;
-
-                    // Forward to UI only if 50ms elapsed or worker completed
-                    if let Some(obs) = &observer
-                        && (status == 1 || last_ui_update.elapsed() >= Duration::from_millis(50))
-                    {
-                        let active_count = session.parts.iter().filter(|p| !p.completed).count();
-                        // Use pending_bytes
-                        obs.on_progress(worker_id, pending_bytes, active_count);
-                        pending_bytes = 0;
-                        last_ui_update = Instant::now();
-                    }
-                    
-                    // Work-stealing: if this worker just completed, help the slowest worker
-                    if status == 1 {
-                        // Find slowest worker (most bytes remaining)
-                        let mut slowest: Option<(u8, u64, u64)> = None; // (id, remaining, current)
-                        
-                        for part in &session.parts {
-                            if !part.completed {
-                                let remaining = part.end_byte.saturating_sub(part.current_byte);
-                                // Only steal if remaining is > 5MB
-                                if remaining > 5 * 1024 * 1024 {
-                                    if let Some((_, max_rem, _)) = slowest {
-                                        if remaining > max_rem {
-                                            slowest = Some((part.id, remaining, part.current_byte));
-                                        }
-                                    } else {
-                                        slowest = Some((part.id, remaining, part.current_byte));
-                                    }
-                                }
-                            }
-                        }
-                        
-                        if let Some((slow_id, _, slow_current)) = slowest {
-                            // Steal the back half
-                            if let Some(part_idx) = session.parts.iter().position(|p| p.id == slow_id) {
-                                let part = &mut session.parts[part_idx];
-                                let old_end = part.end_byte;
-                                let current = part.current_byte.max(slow_current); // Use latest position
-                                let split_point = current + (old_end - current) / 2;
-                                
-                                // Update the slow worker's end
-                                part.end_byte = split_point;
-                                if let Some(atomic) = worker_controls.get(&slow_id) {
-                                    atomic.store(split_point, Ordering::Relaxed);
-                                }
-                                
-                                // Create new part for this helper worker
-                                let new_part_start = split_point + 1;
-                                let new_part_end = old_end;
-                                let new_id = next_worker_id;
-                                next_worker_id += 1;
-                                
-                                let new_part = super::session::DownloadPart {
-                                    id: new_id,
-                                    start_byte: new_part_start,
-                                    end_byte: new_part_end,
-                                    current_byte: new_part_start,
-                                    completed: false,
-                                };
-                                
-                                let atomic_end_new = Arc::new(AtomicU64::new(new_part_end));
-                                worker_controls.insert(new_id, atomic_end_new.clone());
-                                
-                                let worker = Worker::new(
-                                    new_id,
-                                    session.url.clone(),
-                                    (new_part_start, new_part_end),
-                                    session.output_path.clone(),
-                                    self.client.clone(),
-                                    worker_tx.clone(), // Reuse the main sender
-                                    Some(atomic_end_new),
-                                );
-                                
-                                handles.push(tokio::spawn(async move { worker.run().await }));
-                                session.parts.push(new_part);
-                                
-                                log::info!("Worker {} done, stealing from {} ({}-{})", 
-                                    worker_id, slow_id, new_part_start, new_part_end);
-                            }
-                        }
-                    }
+            if remaining == 0 {
+                break;
+            }
+            let ceiling = {
+                let mut c = concurrency.lock().await;
+                c.recover();
+                c.ceiling
+            };
+            while active.len() < ceiling {
+                let Some(index) = pending.pop_front() else {
+                    break;
+                };
+                let part = &session.parts[index];
+                active.insert(index);
+                let worker = Worker {
+                    index,
+                    url: session.url.clone(),
+                    range: (part.current_byte, part.end_byte),
+                    ranged: session.accepts_ranges,
+                    validator: session
+                        .etag
+                        .clone()
+                        .or_else(|| session.last_modified.clone()),
+                    output_path: session.output_path.clone(),
+                    client: self.client.clone(),
+                    tx: tx.clone(),
+                    concurrency: concurrency.clone(),
+                    limiter: self.limiter.clone(),
+                };
+                tasks.spawn(worker.run());
+            }
+            tokio::select! {
+                _ = tick.tick() => {},
+                event = rx.recv() => match event {
+                    Some(WorkerEvent::Progress(index, bytes)) => {
+                        session.parts[index].current_byte += bytes;
+                        pending_bytes += bytes;
+                    },
+                    Some(WorkerEvent::Finished(index, outcome)) => {
+                        active.remove(&index);
+                        match outcome { Ok(()) => { session.parts[index].completed = true; remaining -= 1; }, Err(e) => { result = Err(e); break; } }
+                    },
+                    None => { result = Err(anyhow::anyhow!("Transfer workers stopped unexpectedly")); break; }
                 }
-                Ok(None) => break,
-                Err(_) => {}
             }
-            
-            // Periodically save
-            if let Some(path) = &session_file
-                && last_save.elapsed().as_secs() >= 1
-            {
-                let _ = session.save(path).await;
-                last_save = std::time::Instant::now();
+            if last_report.elapsed() >= Duration::from_millis(100) {
+                if let Some(obs) = &observer {
+                    obs.on_progress(0, pending_bytes, active.len());
+                }
+                pending_bytes = 0;
+                last_report = tokio::time::Instant::now();
+            }
+            while let Some(joined) = tasks.try_join_next() {
+                if let Err(e) = joined {
+                    result = Err(e.into());
+                    break;
+                }
+            }
+            if result.is_err() {
+                break;
+            }
+            if last_save.elapsed() >= Duration::from_secs(1) {
+                if let Err(e) = file.sync_data().await {
+                    result = Err(e.into());
+                    break;
+                }
+                if let Some(path) = &session_file
+                    && let Err(e) = session.save(path).await
+                {
+                    result = Err(e);
+                    break;
+                }
+                last_save = tokio::time::Instant::now();
             }
         }
-
-        // Flush any remaining accumulated bytes to UI
-        if pending_bytes > 0
-            && let Some(obs) = &observer
-        {
-            let active_count = session.parts.iter().filter(|p| !p.completed).count();
-            obs.on_progress(0, pending_bytes, active_count);
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        while let Ok(event) = rx.try_recv() {
+            if let WorkerEvent::Progress(index, bytes) = event {
+                session.parts[index].current_byte += bytes;
+                pending_bytes += bytes;
+            }
         }
-
-        session.state = DownloadState::Completed;
+        if let Some(obs) = &observer {
+            obs.on_progress(0, pending_bytes, 0);
+        }
+        file.sync_data().await?;
+        session.state = match &result {
+            Ok(()) => DownloadState::Completed,
+            Err(e) if e.to_string() == "cancelled" => DownloadState::Paused,
+            Err(e) => DownloadState::Error(e.to_string()),
+        };
         if let Some(path) = &session_file {
-             let _ = session.save(path).await;
+            session.save(path).await?;
         }
-
-        drop(rx);
-
-        // Wait for all workers
-        for handle in handles {
-            let _ = handle.await;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-
-    struct MockObserver {
-        progress: Mutex<Vec<(u8, u64, usize)>>,
-    }
-
-    impl MockObserver {
-        fn new() -> Self {
-            Self {
-                progress: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl DownloadObserver for MockObserver {
-        fn on_progress(&self, worker_id: u8, bytes_downloaded: u64, active_workers: usize) {
-            self.progress.lock().unwrap().push((worker_id, bytes_downloaded, active_workers));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_observer_reporting() {
-        let observer = Arc::new(MockObserver::new());
-        let _downloader = Downloader::new("test").unwrap();
-        
-        // This is a bit hard to test without a real server or mocking the worker.
-        // But we can at least verify the observer trait works.
-        observer.on_progress(1, 1024, 1);
-        
-        let progress = observer.progress.lock().unwrap();
-        assert_eq!(progress.len(), 1);
-        assert_eq!(progress[0], (1, 1024, 1));
+        result
     }
 }

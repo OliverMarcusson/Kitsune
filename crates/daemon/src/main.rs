@@ -33,6 +33,13 @@ enum Command {
     CancelDownload {
         download_id: String,
     },
+    SetRate {
+        bytes_per_second: u64,
+    },
+    ReplaceUrl {
+        path: String,
+        url: String,
+    },
     Ping,
 }
 
@@ -79,6 +86,12 @@ struct StdoutObserver {
 }
 
 impl DownloadObserver for StdoutObserver {
+    fn on_started(&self, downloaded: u64, total: Option<u64>) {
+        let _ = self.writer.send(Outgoing::Event {
+            event: "download-started",
+            body: serde_json::json!({ "downloadId": self.download_id, "downloadedBytes": downloaded, "totalSize": total.unwrap_or(0) }),
+        });
+    }
     fn on_progress(&self, _worker_id: u8, bytes_downloaded: u64, active_workers: usize) {
         let _ = self.writer.send(Outgoing::Event {
             event: "download-progress",
@@ -94,6 +107,8 @@ impl DownloadObserver for StdoutObserver {
 #[derive(Default)]
 struct State {
     cancel_flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    limiter: Arc<kitsune_core::controls::RateLimiter>,
+    shutting_down: AtomicBool,
 }
 
 #[tokio::main]
@@ -120,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(State::default());
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut requests = tokio::task::JoinSet::new();
 
     while let Some(line) = lines.next_line().await? {
         let line = line.trim().to_string();
@@ -137,10 +153,16 @@ async fn main() -> anyhow::Result<()> {
 
         // Each request is handled concurrently so a long download does not block
         // metadata lookups or cancellations.
-        tokio::spawn(handle(request, Arc::clone(&state), tx.clone()));
+        requests.spawn(handle(request, Arc::clone(&state), tx.clone()));
+        while requests.try_join_next().is_some() {}
     }
 
-    // stdin closed — Electron exited. Drop the last sender so the writer finishes.
+    state.shutting_down.store(true, Ordering::Relaxed);
+    for flag in state.cancel_flags.lock().unwrap().values() {
+        flag.store(true, Ordering::Relaxed);
+    }
+    while requests.join_next().await.is_some() {}
+    // All writers have stopped and saved their checkpoints before shutdown.
     drop(tx);
     let _ = writer_task.await;
     Ok(())
@@ -150,6 +172,41 @@ async fn handle(request: Request, state: Arc<State>, writer: Writer) {
     let Request { id, command } = request;
 
     match command {
+        Command::SetRate { bytes_per_second } => {
+            state.limiter.set_rate(bytes_per_second);
+            let _ = writer.send(Outgoing::Ok {
+                id,
+                ok: serde_json::Value::Null,
+            });
+        }
+        Command::ReplaceUrl { path, url } => {
+            let result = async {
+                let file = std::path::PathBuf::from(format!("{path}.kitsune"));
+                if !file.exists() {
+                    kitsune_core::Downloader::new(USER_AGENT)?
+                        .get_remote_metadata(&url)
+                        .await?;
+                    return Ok(());
+                }
+                let mut session = kitsune_core::DownloadSession::load(&file).await?;
+                kitsune_core::Downloader::new(USER_AGENT)?
+                    .validate_resume(&mut session, &url)
+                    .await?;
+                session.save(&file).await
+            }
+            .await;
+            let message = match result {
+                Ok(()) => Outgoing::Ok {
+                    id,
+                    ok: serde_json::Value::Null,
+                },
+                Err(e) => Outgoing::Err {
+                    id,
+                    error: e.to_string(),
+                },
+            };
+            let _ = writer.send(message);
+        }
         Command::Ping => {
             let _ = writer.send(Outgoing::Ok {
                 id,
@@ -190,12 +247,35 @@ async fn handle(request: Request, state: Arc<State>, writer: Writer) {
             path,
             connections,
         } => {
+            let cancel_flag =
+                Arc::new(AtomicBool::new(state.shutting_down.load(Ordering::Relaxed)));
+            {
+                let mut flags = state.cancel_flags.lock().unwrap();
+                if flags.contains_key(&download_id) {
+                    let _ = writer.send(Outgoing::Err {
+                        id,
+                        error: "Download is already running".into(),
+                    });
+                    return;
+                }
+                flags.insert(download_id.clone(), cancel_flag.clone());
+            }
             // Acknowledge immediately; the download reports via events.
             let _ = writer.send(Outgoing::Ok {
                 id,
                 ok: serde_json::Value::Null,
             });
-            run_download(download_id, url, path, connections, state, writer).await;
+            run_download(
+                download_id.clone(),
+                url,
+                path,
+                connections,
+                state.clone(),
+                writer,
+                cancel_flag,
+            )
+            .await;
+            state.cancel_flags.lock().unwrap().remove(&download_id);
         }
     }
 }
@@ -217,9 +297,10 @@ async fn run_download(
     connections: u8,
     state: Arc<State>,
     writer: Writer,
+    cancel_flag: Arc<AtomicBool>,
 ) {
     let downloader = match kitsune_core::Downloader::new(USER_AGENT) {
-        Ok(d) => d,
+        Ok(d) => d.with_limiter(state.limiter.clone()),
         Err(e) => return emit_error(&writer, &download_id, &e.to_string()),
     };
 
@@ -234,6 +315,13 @@ async fn run_download(
             Err(e) => return emit_error(&writer, &download_id, &e.to_string()),
         }
     } else {
+        if output_path.exists() {
+            return emit_error(
+                &writer,
+                &download_id,
+                "Destination already exists; choose a different filename",
+            );
+        }
         match downloader
             .init_download(&url, Some(output_path), connections)
             .await
@@ -247,11 +335,6 @@ async fn run_download(
         writer: writer.clone(),
         download_id: download_id.clone(),
     });
-
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    if let Ok(mut flags) = state.cancel_flags.lock() {
-        flags.insert(download_id.clone(), Arc::clone(&cancel_flag));
-    }
 
     let result = downloader
         .run(

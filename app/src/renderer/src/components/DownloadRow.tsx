@@ -43,6 +43,7 @@ const STATUS_META: Record<
 > = {
   downloading: { label: "Downloading", badge: "default", indicator: "bg-primary" },
   paused: { label: "Paused", badge: "warning", indicator: "bg-warning" },
+  queued: { label: "Queued", badge: "warning", indicator: "bg-warning" },
   completed: { label: "Completed", badge: "success", indicator: "bg-success" },
   error: { label: "Failed", badge: "destructive", indicator: "bg-destructive" },
 }
@@ -115,6 +116,7 @@ interface DownloadRowProps {
   onRemove: (id: string) => void
   onDismiss: (id: string) => void
   onOpenFolder: (path: string) => void
+  onRepair: (id: string) => void
 }
 
 export function DownloadRow({
@@ -124,6 +126,7 @@ export function DownloadRow({
   onRemove,
   onDismiss,
   onOpenFolder,
+  onRepair,
 }: DownloadRowProps) {
   const { filename, url, totalSize, downloadedBytes, speed, eta, status, connections, error, path } =
     download
@@ -182,7 +185,7 @@ export function DownloadRow({
                 {meta.label}
               </Badge>
 
-              {status === "downloading" && (
+              {(status === "downloading" || status === "queued") && (
                 <IconButton label="Pause" onClick={() => onPause(download.id)}>
                   <Pause className="fill-current" />
                 </IconButton>
@@ -234,6 +237,10 @@ export function DownloadRow({
                     <FolderOpen />
                     Show in folder
                   </DropdownMenuItem>
+                  {download.kind !== 'torrent' && (status === 'paused' || status === 'error') && <DropdownMenuItem onSelect={() => onRepair(download.id)}>
+                    <RotateCcw />
+                    Repair expired link
+                  </DropdownMenuItem>}
                   <DropdownMenuSeparator />
                   <DropdownMenuItem onSelect={() => onDismiss(download.id)}>
                     <X />
@@ -293,7 +300,7 @@ export function DownloadRow({
                     </span>
                     <span className="flex items-center gap-1.5">
                       <Layers className="h-3.5 w-3.5" />
-                      <ConnectionPips total={connections} active={download.activeConnections} />
+                      {download.kind === 'torrent' ? `${download.activeConnections} peers` : <ConnectionPips total={connections} active={download.activeConnections} />}
                     </span>
                   </>
                 )}

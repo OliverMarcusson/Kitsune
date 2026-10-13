@@ -32,6 +32,7 @@ export class Sidecar extends EventEmitter {
   private pending = new Map<string, Pending>()
   private nextId = 0
   private stopping = false
+  private running = new Set<string>()
 
   /**
    * Packaged builds ship the binary in `resources/`. In development we hunt for
@@ -97,6 +98,8 @@ export class Sidecar extends EventEmitter {
       const reason = new Error(`kitsune-daemon exited (code=${code} signal=${signal})`)
       for (const { reject } of this.pending.values()) reject(reason)
       this.pending.clear()
+      for (const downloadId of this.running) this.emit('download-error', { downloadId, error: reason.message })
+      this.running.clear()
 
       this.child = null
       this.reader?.close()
@@ -124,6 +127,9 @@ export class Sidecar extends EventEmitter {
     }
 
     if (msg.event) {
+      if (['download-paused', 'download-completed', 'download-error'].includes(msg.event)) {
+        this.running.delete((msg as unknown as { downloadId: string }).downloadId)
+      }
       this.emit(msg.event, msg)
       return
     }
@@ -162,16 +168,25 @@ export class Sidecar extends EventEmitter {
     path: string
     connections: number
   }): Promise<void> {
-    return this.request('start_download', {
+    this.running.add(opts.downloadId)
+    return this.request<void>('start_download', {
       download_id: opts.downloadId,
       url: opts.url,
       path: opts.path,
       connections: opts.connections
-    })
+    }).catch(error => { this.running.delete(opts.downloadId); throw error })
   }
 
   cancelDownload(downloadId: string): Promise<void> {
     return this.request('cancel_download', { download_id: downloadId })
+  }
+
+  setRate(bytesPerSecond: number): Promise<void> {
+    return this.request('set_rate', { bytes_per_second: bytesPerSecond })
+  }
+
+  replaceUrl(path: string, url: string): Promise<void> {
+    return this.request('replace_url', { path, url })
   }
 
   stop(): void {

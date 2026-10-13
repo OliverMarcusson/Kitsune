@@ -27,6 +27,12 @@ pub struct DownloadSession {
     pub state: DownloadState,
     pub parts: Vec<DownloadPart>,
     pub connections: u8,
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub last_modified: Option<String>,
+    #[serde(default)]
+    pub accepts_ranges: bool,
 }
 
 impl DownloadSession {
@@ -38,12 +44,17 @@ impl DownloadSession {
             state: DownloadState::Pending,
             parts: Vec::new(),
             connections,
+            etag: None,
+            last_modified: None,
+            accepts_ranges: false,
         }
     }
 
     pub async fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        tokio::fs::write(path, json).await?;
+        let temporary = path.with_extension("kitsune.tmp");
+        tokio::fs::write(&temporary, json).await?;
+        tokio::fs::rename(temporary, path).await?;
         Ok(())
     }
 

@@ -6,7 +6,10 @@ import type {
   PausedPayload,
   PersistedDownload,
   ProgressPayload,
-  StartDownloadOptions
+  StartDownloadOptions,
+  StartedPayload,
+  StatePayload,
+  TransferSettings
 } from '../shared/ipc'
 
 /**
@@ -31,6 +34,12 @@ const api = {
 
   cancelDownload: (downloadId: string): Promise<void> =>
     ipcRenderer.invoke('cancel-download', downloadId),
+  configureTransfers: (settings: TransferSettings): Promise<void> => ipcRenderer.invoke('configure-transfers', settings),
+  restoreQueue: (downloads: PersistedDownload[]): Promise<void> => ipcRenderer.invoke('restore-queue', downloads),
+  replaceUrl: (id: string, url: string): Promise<void> => ipcRenderer.invoke('replace-url', id, url),
+  forgetDownload: (id: string): Promise<void> => ipcRenderer.invoke('forget-download', id),
+  deleteDownload: (opts: StartDownloadOptions): Promise<void> => ipcRenderer.invoke('delete-download', opts),
+  pickTorrent: (): Promise<string | null> => ipcRenderer.invoke('pick-torrent'),
 
   showInFolder: (path: string): Promise<void> => ipcRenderer.invoke('show-in-folder', path),
 
@@ -48,6 +57,8 @@ const api = {
 
   onDownloadProgress: (cb: (p: ProgressPayload) => void): Unsubscribe =>
     subscribe('download-progress', cb),
+  onDownloadStarted: (cb: (p: StartedPayload) => void): Unsubscribe => subscribe('download-started', cb),
+  onDownloadState: (cb: (p: StatePayload) => void): Unsubscribe => subscribe('download-state', cb),
   onDownloadCompleted: (cb: (p: CompletedPayload) => void): Unsubscribe =>
     subscribe('download-completed', cb),
   onDownloadError: (cb: (p: ErrorPayload) => void): Unsubscribe => subscribe('download-error', cb),

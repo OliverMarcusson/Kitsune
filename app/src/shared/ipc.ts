@@ -4,6 +4,7 @@ export interface Metadata {
   filename: string
   size: number
   url: string
+  kind?: 'http' | 'torrent'
 }
 
 export interface ProgressPayload {
@@ -31,6 +32,33 @@ export interface StartDownloadOptions {
   url: string
   path: string
   connections: number
+  kind?: 'http' | 'torrent'
+}
+
+export interface StartedPayload {
+  downloadId: string
+  downloadedBytes: number
+  totalSize: number
+  filename?: string
+}
+
+export interface StatePayload {
+  downloadId: string
+  status: 'queued' | 'downloading' | 'paused'
+}
+
+export interface TransferSettings {
+  speedLimit: number
+  slowMode: boolean
+  slowSpeed: number
+  maxActive: number
+  schedule: {
+    enabled: boolean
+    start: string
+    stop: string
+    days: number[]
+    endDate: string
+  }
 }
 
 /**
@@ -47,4 +75,5 @@ export interface PersistedDownload {
   status: string
   connections: number
   started_at: number
+  kind?: 'http' | 'torrent'
 }

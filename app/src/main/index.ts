@@ -5,6 +5,10 @@ import { homedir } from 'node:os'
 import { Sidecar } from './sidecar'
 import { ShimBridge } from './shim-bridge'
 import { kitsuneConfigDir, stateFilePath } from './paths'
+import { Torrents, isTorrentSource } from './torrents'
+import { Transfers } from './transfers'
+import type { PersistedDownload, StartDownloadOptions, TransferSettings } from '../shared/ipc'
+import { DEFAULT_TRANSFERS } from '../shared/transfer-policy'
 
 const PROTOCOL = 'kitsune'
 
@@ -14,11 +18,14 @@ let quitting = false
 
 const sidecar = new Sidecar()
 const shimBridge = new ShimBridge()
+const torrents = new Torrents()
+const transfers = new Transfers(sidecar, torrents)
+let shutdownStarted = false
 
 /** Pull a kitsune:// or http(s) URL out of argv (deep link / shim launch). */
 function extractUrlFromArgs(argv: string[]): string | null {
   for (const arg of argv) {
-    if (arg.startsWith(`${PROTOCOL}://`) || arg.startsWith('http://') || arg.startsWith('https://')) {
+    if (arg.startsWith(`${PROTOCOL}://`) || arg.startsWith('http://') || arg.startsWith('https://') || isTorrentSource(arg)) {
       return arg
     }
   }
@@ -115,15 +122,34 @@ function createTray(): void {
 
 function registerIpcHandlers(): void {
   // --- delegated to the Rust sidecar ---
-  ipcMain.handle('get-metadata', (_e, url: string) => sidecar.getMetadata(url))
+  ipcMain.handle('get-metadata', (_e, url: string) => isTorrentSource(url) ? torrents.metadata(url) : sidecar.getMetadata(url))
 
   ipcMain.handle(
     'start-download',
-    (_e, opts: { downloadId: string; url: string; path: string; connections: number }) =>
-      sidecar.startDownload(opts)
+    (_e, opts: StartDownloadOptions) => transfers.start(opts)
   )
 
-  ipcMain.handle('cancel-download', (_e, downloadId: string) => sidecar.cancelDownload(downloadId))
+  ipcMain.handle('cancel-download', (_e, downloadId: string) => transfers.pause(downloadId))
+  ipcMain.handle('restore-queue', (_e, downloads: PersistedDownload[]) => transfers.restore(downloads))
+  ipcMain.handle('forget-download', (_e, id: string) => transfers.forget(id))
+  ipcMain.handle('replace-url', (_e, id: string, url: string) => transfers.replaceUrl(id, url, (path, fresh) => sidecar.replaceUrl(path, fresh)))
+  ipcMain.handle('configure-transfers', (_e, settings: TransferSettings) => {
+    transfers.configure(settings)
+    mkdirSync(kitsuneConfigDir(), { recursive: true })
+    writeFileSync(join(kitsuneConfigDir(), 'transfers.json'), JSON.stringify(settings))
+  })
+  ipcMain.handle('delete-download', async (_e, opts: StartDownloadOptions) => {
+    await transfers.forget(opts.downloadId)
+    if (opts.kind === 'torrent') await torrents.deleteFiles(opts)
+    else {
+      rmSync(`${opts.path}.kitsune`, { force: true })
+      rmSync(opts.path, { force: true })
+    }
+  })
+  ipcMain.handle('pick-torrent', async () => {
+    const result = await dialog.showOpenDialog({ title: 'Open torrent', filters: [{ name: 'BitTorrent metainfo', extensions: ['torrent'] }], properties: ['openFile'] })
+    return result.canceled ? null : result.filePaths[0] || null
+  })
 
   // --- handled natively; these never needed Rust ---
   ipcMain.handle('show-in-folder', (_e, path: string) => {
@@ -178,10 +204,13 @@ function forwardSidecarEvents(): void {
     'download-progress',
     'download-completed',
     'download-error',
-    'download-paused'
+    'download-paused',
+    'download-started',
+    'download-state'
   ]) {
-    sidecar.on(event, (msg) => sendToRenderer(event, msg))
+    transfers.on(event, (msg) => sendToRenderer(event, msg))
   }
+  transfers.on('transfer-error', error => console.error('[kitsune] transfer controls:', error.message))
 }
 
 // A second launch must hand its URL to the running instance, not start a rival app.
@@ -218,6 +247,8 @@ if (!app.requestSingleInstanceLock()) {
     }
 
     forwardSidecarEvents()
+    try { transfers.configure(JSON.parse(readFileSync(join(kitsuneConfigDir(), 'transfers.json'), 'utf8'))) }
+    catch { transfers.configure(DEFAULT_TRANSFERS) }
     registerIpcHandlers()
     createWindow()
     createTray()
@@ -232,8 +263,13 @@ if (!app.requestSingleInstanceLock()) {
     })
   })
 
-  app.on('before-quit', () => {
+  app.on('before-quit', (event) => {
     quitting = true
+    if (!shutdownStarted) {
+      event.preventDefault()
+      shutdownStarted = true
+      void transfers.stop().then(() => torrents.stop()).finally(() => app.quit())
+    }
   })
 
   // A bare SIGTERM (logout, shutdown, `kill`) skips `will-quit`, which would

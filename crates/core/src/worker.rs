@@ -1,153 +1,166 @@
-use anyhow::Result;
-use reqwest::header::RANGE;
-use reqwest::Client;
-use std::path::PathBuf;
-use tokio::fs::OpenOptions;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use tokio::sync::mpsc;
+use crate::controls::{Concurrency, RateLimiter};
+use anyhow::{Result, bail};
+use reqwest::{Client, StatusCode, header};
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use tokio::{
+    fs::OpenOptions,
+    io::{AsyncSeekExt, AsyncWriteExt, SeekFrom},
+    sync::{Mutex, mpsc},
+};
+
+pub enum WorkerEvent {
+    Progress(usize, u64),
+    Finished(usize, Result<()>),
+}
 
 pub struct Worker {
-    pub id: u8,
-    url: String,
-    range: (u64, u64),
-    output_path: PathBuf,
-    client: Client,
-    progress_tx: mpsc::Sender<(u8, u64, u8)>, // (worker_id, bytes_written, status: 0=progress 1=complete 2=error)
-    end_byte_atomic: Option<Arc<AtomicU64>>,
+    pub index: usize,
+    pub url: String,
+    pub range: (u64, u64),
+    pub ranged: bool,
+    pub validator: Option<String>,
+    pub output_path: PathBuf,
+    pub client: Client,
+    pub tx: mpsc::Sender<WorkerEvent>,
+    pub concurrency: Arc<Mutex<Concurrency>>,
+    pub limiter: Arc<RateLimiter>,
 }
 
 impl Worker {
-    pub fn new(
-        id: u8,
-        url: String,
-        range: (u64, u64),
-        output_path: PathBuf,
-        client: Client,
-        progress_tx: mpsc::Sender<(u8, u64, u8)>,
-        end_byte_atomic: Option<Arc<AtomicU64>>,
-    ) -> Self {
-        Self {
-            id,
-            url,
-            range,
-            output_path,
-            client,
-            progress_tx,
-            end_byte_atomic,
-        }
+    pub async fn run(self) {
+        let result = self.transfer().await;
+        let _ = self
+            .tx
+            .send(WorkerEvent::Finished(self.index, result))
+            .await;
     }
 
-    pub async fn run(self) -> Result<()> {
-        let tx = self.progress_tx.clone();
-        let id = self.id;
-        
-        // Use a wrapper to catch errors and report them
-        match self.do_run().await {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                log::error!("Worker {} encountered a fatal error: {}", id, e);
-                // Report error status (2) so main loop knows to abort
-                let _ = tx.send((id, 0, 2)).await;
-                Err(e)
-            }
-        }
-    }
-
-    async fn do_run(self) -> Result<()> {
-        let mut current_pos = self.range.0;
-        
+    async fn transfer(&self) -> Result<()> {
+        let mut position = self.range.0;
         let mut retries = 0;
-        let max_retries = 5;
-        let mut backoff = std::time::Duration::from_secs(1);
-
         loop {
-            if current_pos > self.range.1 {
-                let _ = self.progress_tx.send((self.id, 0, 1)).await;
-                return Ok(());
-            }
-
-            if retries >= max_retries {
-                return Err(anyhow::anyhow!("Worker {} failed after {} retries", self.id, retries));
-            }
-
-            let range_header = format!("bytes={}-{}", current_pos, self.range.1);
-
-            let response_result = self.client
+            let permit = loop {
+                if let Some(permit) = self.concurrency.lock().await.acquire() {
+                    break permit;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            let mut request = self
+                .client
                 .get(&self.url)
-                .header(RANGE, range_header.clone())
-                .send()
-                .await;
-
-            match response_result {
-                Ok(response) => {
+                .header(header::ACCEPT_ENCODING, "identity");
+            if self.ranged {
+                request =
+                    request.header(header::RANGE, format!("bytes={position}-{}", self.range.1));
+                if let Some(validator) = &self.validator {
+                    request = request.header(header::IF_RANGE, validator);
+                }
+            }
+            let mut delay = Duration::from_secs(1 << retries.min(5));
+            match request.send().await {
+                Ok(mut response) => {
                     let status = response.status();
-                    if status.is_success() {
-                        let mut run_response = response;
+                    if matches!(
+                        status,
+                        StatusCode::FORBIDDEN
+                            | StatusCode::TOO_MANY_REQUESTS
+                            | StatusCode::SERVICE_UNAVAILABLE
+                    ) {
+                        self.concurrency.lock().await.refused();
+                        if let Some(seconds) = response
+                            .headers()
+                            .get(header::RETRY_AFTER)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.parse::<u64>().ok())
+                        {
+                            delay = Duration::from_secs(seconds.min(300)).max(delay);
+                        }
+                    } else {
+                        response.error_for_status_ref()?;
+                        if self.ranged {
+                            let expected = format!("bytes {position}-{}", self.range.1);
+                            let actual = response
+                                .headers()
+                                .get(header::CONTENT_RANGE)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("");
+                            if status != StatusCode::PARTIAL_CONTENT
+                                || actual.split('/').next() != Some(expected.as_str())
+                            {
+                                bail!(
+                                    "Server changed the file or ignored the byte range; refusing to mix file versions"
+                                );
+                            }
+                            if let Some(validator) = &self.validator {
+                                let key = if validator.starts_with('"') {
+                                    header::ETAG
+                                } else {
+                                    header::LAST_MODIFIED
+                                };
+                                if let Some(actual) =
+                                    response.headers().get(key).and_then(|v| v.to_str().ok())
+                                    && actual != validator
+                                {
+                                    bail!("File version changed during transfer");
+                                }
+                            }
+                        }
                         let mut file = OpenOptions::new()
                             .write(true)
-                            .create(false) 
                             .open(&self.output_path)
                             .await?;
-                
-                        file.seek(SeekFrom::Start(current_pos)).await?;
-                
-                        let mut stream_error: Option<anyhow::Error> = None;
-                        
+                        file.seek(SeekFrom::Start(position)).await?;
+                        let mut interrupted = false;
                         loop {
-                            match run_response.chunk().await {
+                            match response.chunk().await {
                                 Ok(Some(chunk)) => {
-                                    let len = chunk.len() as u64;
-                                    
-                                    if let Some(atomic_end) = &self.end_byte_atomic {
-                                        let actual_end = atomic_end.load(Ordering::Relaxed);
-                                        if current_pos >= actual_end {
-                                            break; // Done (split or completed range)
+                                    for bytes in chunk.chunks(16 * 1024) {
+                                        if self.ranged
+                                            && bytes.len() as u64 > self.range.1 + 1 - position
+                                        {
+                                            bail!("Server sent more bytes than requested");
                                         }
-                                    }
-                                
-                                    if let Err(e) = file.write_all(&chunk).await {
-                                        stream_error = Some(e.into());
-                                        break;
-                                    }
-                                    
-                                    current_pos += len;
-                                    
-                                    if self.progress_tx.send((self.id, len, 0)).await.is_err() {
-                                        return Ok(()); // Receiver dropped
+                                        self.limiter.acquire(bytes.len()).await;
+                                        file.write_all(bytes).await?;
+                                        position += bytes.len() as u64;
+                                        self.tx
+                                            .send(WorkerEvent::Progress(
+                                                self.index,
+                                                bytes.len() as u64,
+                                            ))
+                                            .await?;
                                     }
                                 }
-                                Ok(None) => break, // EOF, success
-                                Err(e) => {
-                                    stream_error = Some(e.into());
+                                Ok(None) => break,
+                                Err(_) => {
+                                    interrupted = true;
                                     break;
                                 }
                             }
                         }
-                        
-                        if let Some(e) = stream_error {
-                            log::warn!("Worker {} stream error: {}. Retrying...", self.id, e);
-                        } else {
-                            // Success!
-                            let _ = self.progress_tx.send((self.id, 0, 1)).await;
+                        file.sync_data().await?;
+                        if !interrupted && (!self.ranged || position == self.range.1 + 1) {
+                            self.concurrency.lock().await.successful();
                             return Ok(());
                         }
-                    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-                        log::warn!("Worker {} received {}. Retrying...", self.id, status);
-                    } else {
-                        response.error_for_status()?;
+                        if self.ranged && position == self.range.1 + 1 {
+                            return Ok(());
+                        }
+                        if !self.ranged {
+                            bail!("Stream interrupted; this server does not support safe resume");
+                        }
                     }
-                },
-                Err(e) => {
-                    log::warn!("Worker {} connection failed: {}. Retrying...", self.id, e);
-                },
+                }
+                Err(_) => self.concurrency.lock().await.refused(),
             }
-
-            log::info!("Worker {} sleeping for {:?} before retry {}", self.id, backoff, retries + 1);
-            tokio::time::sleep(backoff).await;
+            drop(permit);
             retries += 1;
-            backoff *= 2;
+            if retries >= 8 {
+                bail!(
+                    "Transfer refused or interrupted after eight retries; the link may have expired"
+                );
+            }
+            tokio::time::sleep(delay).await;
         }
     }
 }

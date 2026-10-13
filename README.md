@@ -24,6 +24,64 @@
 - **Cross-platform installers** for Linux (`.deb` and `.pkg.tar.zst`) and Windows.
 - **Smart setup** that registers native host manifests automatically during installation.
 - **Deep-link support** for `kitsune://` protocol triggers.
+- **Safer resume and expired-link repair** with server file-version checks.
+- **Adaptive parallel downloads**, a shared speed cap, and one-click Slow mode.
+- **Download schedules and queues** that keep running when the window is hidden.
+- **Built-in BitTorrent downloads** from magnet links, torrent URLs, and local `.torrent` files.
+
+## Transfer controls
+
+In **Settings**, choose a total download cap in MiB/s (zero is unlimited), the
+Slow mode cap (2 MiB/s by default), and how many downloads may run at once.
+The header's **Slow mode** button applies immediately. Direct downloads and
+torrents share the total budget; when both engines are active, the budget is
+divided in proportion to their active download counts.
+
+Enable **Download schedule** to choose local start/stop times, repeat days, and
+an optional end date. Downloads outside the window wait in **Queued**. At the
+stop time, active transfers close their connections and keep their progress;
+they resume at the next window. Manually paused downloads stay paused. Overnight
+windows belong to the day they start. Keep Kitsune running and the PC awake;
+the schedule does not wake it. Fetching link details can use data outside the
+window, but torrent payloads and peer discovery start only when queued work runs.
+
+For a failed or paused direct download, choose **More actions → Repair expired
+link**, paste the fresh URL, and resume after verification. Kitsune checks the
+size and a strong ETag, or Last-Modified when no strong ETag is available, before
+reusing bytes. If the server cannot prove the file version, the file changed,
+the partial file is missing/truncated, or ranges are unavailable, resume fails
+without overwriting the partial file. Older checkpoints without version metadata
+cannot safely resume; start a new download with a different filename or explicitly
+delete the old partial download first.
+
+Direct transfers use a shared queue of blocks up to 8 MiB. Connection counts are
+ceilings: the engine starts with up to eight, increases on healthy responses,
+backs off on refused connections (403, 429, 503) and connection errors, respects
+numeric Retry-After, and recovers one connection per quiet minute.
+
+Paste a **magnet link** or **torrent URL**, or choose **Open .torrent file** in
+the new-download dialog. Torrents use WebTorrent in Electron's main process,
+verify existing pieces on resume, and save into a dedicated folder. They upload
+to peers while downloading; pausing, completing, or leaving the schedule window
+closes the torrent's peer connections. Completion does not continue seeding.
+Deleting a torrent removes only files recorded as belonging to that download,
+leaving user-added files and directories intact. Magnet links must use BitTorrent
+v1 (`btih`); v2-only magnets are not supported. Torrent support adds the
+`node-datachannel` native runtime dependency; installers must include its N-API binary.
+
+Verification: `cargo test -p kitsune-core -p kitsune-daemon`,
+`cargo build -p kitsune-daemon`, `npm test --prefix app`, and
+`npm run build --prefix app`. Build the debug daemon before the app tests to
+include the sidecar protocol integration test. Torrent tests also run in
+Electron's Node runtime with `ELECTRON_RUN_AS_NODE=1
+./node_modules/electron/dist/electron --import tsx --test tests/torrents.test.mts`
+from `app/`.
+
+Dependency audit: WebTorrent's tracker dependency currently brings in the
+unpatched `ip` advisory GHSA-2p57-rm9w-gvfp (`isPublic` address classification).
+Kitsune uses the torrent client, not the tracker server, and does not call that
+function; npm still flags the dependency chain. Installer builds on Windows
+and macOS have not been exercised by these local Linux checks.
 
 ---
 
